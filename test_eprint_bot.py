@@ -58,15 +58,22 @@ class TestEprintBot(unittest.TestCase):
     def test_load_save_state(self):
         # Test empty state
         state = eprint_bot.load_state()
-        self.assertEqual(state, set())
+        self.assertEqual(state, {})
         
-        # Save state
-        processed = {"id1", "id2", "id3"}
+        # Save state (dictionary)
+        processed = {"id1": "2026-05-28T15:26:17+00:00", "id2": "2026-05-28T14:24:31+00:00"}
         eprint_bot.save_state(processed)
         
         # Load and verify
         loaded = eprint_bot.load_state()
         self.assertEqual(loaded, processed)
+        
+        # Test migration from old format (list of guids)
+        with open(eprint_bot.STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump({"processed_ids": ["id1", "id2"]}, f)
+            
+        migrated = eprint_bot.load_state()
+        self.assertEqual(migrated, {"id1": "", "id2": ""})
 
     @patch('requests.post')
     def test_summarize_abstract_success(self, mock_post):
@@ -180,10 +187,11 @@ class TestEprintBot(unittest.TestCase):
         self.assertEqual(len(first_call_json["embeds"]), 10)
         self.assertEqual(len(second_call_json["embeds"]), 2)
 
+    @patch('eprint_bot.scrape_paper_metadata')
     @patch('eprint_bot.fetch_rss_feed')
     @patch('eprint_bot.summarize_abstract')
     @patch('eprint_bot.post_batches_to_discord')
-    def test_main_first_run_date_filtering(self, mock_post_discord, mock_summarize, mock_fetch):
+    def test_main_first_run_date_filtering(self, mock_post_discord, mock_summarize, mock_fetch, mock_scrape):
         # Mock RSS Feed Items
         now_utc = datetime.now(timezone.utc)
         current_date_str = now_utc.strftime('%Y-%m-%d')
@@ -215,6 +223,11 @@ class TestEprintBot(unittest.TestCase):
             ET.fromstring(xml_older)
         ]
         
+        mock_scrape.side_effect = lambda url: {
+            "https://eprint.iacr.org/2026/1111": {"modified_time": "2026-05-28T15:26:17+00:00", "published_time": "2026-05-28T15:26:17+00:00"},
+            "https://eprint.iacr.org/2023/2222": {"modified_time": "2023-10-02T22:45:48+00:00", "published_time": "2023-10-02T22:45:48+00:00"}
+        }[url]
+        
         mock_summarize.return_value = "Summary text"
         
         # Setup configs
@@ -240,10 +253,11 @@ class TestEprintBot(unittest.TestCase):
         self.assertIn("https://eprint.iacr.org/2026/1111", state)
         self.assertIn("https://eprint.iacr.org/2023/2222", state)
 
+    @patch('eprint_bot.scrape_paper_metadata')
     @patch('eprint_bot.fetch_rss_feed')
     @patch('eprint_bot.summarize_abstract')
     @patch('eprint_bot.post_batches_to_discord')
-    def test_main_first_run_fallback_filtering(self, mock_post_discord, mock_summarize, mock_fetch):
+    def test_main_first_run_fallback_filtering(self, mock_post_discord, mock_summarize, mock_fetch, mock_scrape):
         # Mock RSS Feed Items containing NO papers today.
         # The newest paper in the feed is from "yesterday".
         yesterday_rss_date = "Mon, 25 May 2026 09:04:12 +0000"
@@ -280,6 +294,12 @@ class TestEprintBot(unittest.TestCase):
             ET.fromstring(xml_yesterday2)
         ]
         
+        mock_scrape.side_effect = lambda url: {
+            "https://eprint.iacr.org/2026/1111": {"modified_time": "2026-05-25T09:04:12+00:00", "published_time": "2026-05-25T09:04:12+00:00"},
+            "https://eprint.iacr.org/2026/1112": {"modified_time": "2026-05-25T09:04:12+00:00", "published_time": "2026-05-25T09:04:12+00:00"},
+            "https://eprint.iacr.org/2023/2222": {"modified_time": "2023-10-02T22:45:48+00:00", "published_time": "2023-10-02T22:45:48+00:00"}
+        }[url]
+        
         mock_summarize.return_value = "Summary text"
         
         # Setup configs
@@ -308,6 +328,137 @@ class TestEprintBot(unittest.TestCase):
         self.assertIn("https://eprint.iacr.org/2026/1111", state)
         self.assertIn("https://eprint.iacr.org/2026/1112", state)
         self.assertIn("https://eprint.iacr.org/2023/2222", state)
+
+    @patch('eprint_bot.scrape_paper_metadata')
+    @patch('eprint_bot.fetch_rss_feed')
+    @patch('eprint_bot.summarize_abstract')
+    @patch('eprint_bot.post_batches_to_discord')
+    def test_main_standard_run_new_paper_and_update_detection(self, mock_post_discord, mock_summarize, mock_fetch, mock_scrape):
+        # 1. Setup existing state in state.json
+        initial_state = {
+            "https://eprint.iacr.org/2026/1111": "2026-05-25T09:00:00+00:00",
+            "https://eprint.iacr.org/2026/1112": "2026-05-25T09:04:12+00:00"
+        }
+        eprint_bot.save_state(initial_state)
+        
+        # XML feed:
+        # Item 1: 2026/1113 (Brand new paper)
+        # Item 2: 2026/1111 (Updated paper, new modified_time)
+        # Item 3: 2026/1112 (Same paper, same modified_time -> triggers break!)
+        xml_new = """
+        <item xmlns:dc="http://purl.org/dc/elements/1.1/">
+          <title>Brand New Paper</title>
+          <link>https://eprint.iacr.org/2026/1113</link>
+          <guid>https://eprint.iacr.org/2026/1113</guid>
+          <pubDate>Mon, 25 May 2026 09:05:00 +0000</pubDate>
+        </item>
+        """
+        xml_updated = """
+        <item xmlns:dc="http://purl.org/dc/elements/1.1/">
+          <title>Updated Paper</title>
+          <link>https://eprint.iacr.org/2026/1111</link>
+          <guid>https://eprint.iacr.org/2026/1111</guid>
+          <pubDate>Mon, 25 May 2026 09:00:00 +0000</pubDate>
+        </item>
+        """
+        xml_same = """
+        <item xmlns:dc="http://purl.org/dc/elements/1.1/">
+          <title>Same Paper</title>
+          <link>https://eprint.iacr.org/2026/1112</link>
+          <guid>https://eprint.iacr.org/2026/1112</guid>
+          <pubDate>Mon, 25 May 2026 09:04:12 +0000</pubDate>
+        </item>
+        """
+        xml_older = """
+        <item xmlns:dc="http://purl.org/dc/elements/1.1/">
+          <title>Older Unreached Paper</title>
+          <link>https://eprint.iacr.org/2026/1114</link>
+          <guid>https://eprint.iacr.org/2026/1114</guid>
+          <pubDate>Mon, 25 May 2026 08:00:00 +0000</pubDate>
+        </item>
+        """
+        
+        mock_fetch.return_value = [
+            ET.fromstring(xml_new),
+            ET.fromstring(xml_updated),
+            ET.fromstring(xml_same),
+            ET.fromstring(xml_older)
+        ]
+        
+        mock_scrape.side_effect = lambda url: {
+            "https://eprint.iacr.org/2026/1113": {"modified_time": "2026-05-25T09:05:00+00:00", "published_time": "2026-05-25T09:05:00+00:00"},
+            "https://eprint.iacr.org/2026/1111": {"modified_time": "2026-05-25T09:10:00+00:00", "published_time": "2026-05-25T09:00:00+00:00"},
+            "https://eprint.iacr.org/2026/1112": {"modified_time": "2026-05-25T09:04:12+00:00", "published_time": "2026-05-25T09:04:12+00:00"},
+            "https://eprint.iacr.org/2026/1114": {"modified_time": "2026-05-25T08:00:00+00:00", "published_time": "2026-05-25T08:00:00+00:00"}
+        }[url]
+        
+        mock_summarize.return_value = "Summary Text"
+        
+        # Execute
+        eprint_bot.main()
+        
+        # 1. Verify summarizes called for Brand New and Updated papers, but NOT for Same or Older
+        self.assertEqual(mock_summarize.call_count, 2)
+        mock_summarize.assert_any_call("Brand New Paper", [], "")
+        mock_summarize.assert_any_call("Updated Paper", [], "")
+        
+        # 2. Verify scrape called for New, Updated, Same, but NOT for Older (due to break!)
+        self.assertEqual(mock_scrape.call_count, 3)
+        mock_scrape.assert_any_call("https://eprint.iacr.org/2026/1113")
+        mock_scrape.assert_any_call("https://eprint.iacr.org/2026/1111")
+        mock_scrape.assert_any_call("https://eprint.iacr.org/2026/1112")
+        
+        # 3. Verify Discord embeds were sent with correct embeds (New & Update)
+        mock_post_discord.assert_called_once()
+        posted_embeds = mock_post_discord.call_args[0][0]
+        self.assertEqual(len(posted_embeds), 2)
+        self.assertEqual(posted_embeds[0]["title"], "Brand New Paper")
+        self.assertEqual(posted_embeds[1]["title"], "🔄 [Update] Updated Paper")
+        
+        # 4. Verify state was updated
+        state = eprint_bot.load_state()
+        self.assertEqual(state["https://eprint.iacr.org/2026/1113"], "2026-05-25T09:05:00+00:00")
+        self.assertEqual(state["https://eprint.iacr.org/2026/1111"], "2026-05-25T09:10:00+00:00")
+
+    @patch('eprint_bot.scrape_paper_metadata')
+    @patch('eprint_bot.fetch_rss_feed')
+    @patch('eprint_bot.summarize_abstract')
+    @patch('eprint_bot.post_batches_to_discord')
+    def test_main_standard_run_migration(self, mock_post_discord, mock_summarize, mock_fetch, mock_scrape):
+        # 1. Setup old list state
+        with open(eprint_bot.STATE_FILE, 'w', encoding='utf-8') as f:
+            json.dump({"processed_ids": ["https://eprint.iacr.org/2026/1111"]}, f)
+            
+        # XML feed:
+        # Item 1: 2026/1111 (Migrated paper, should be scraped but not notified!)
+        xml_migrated = """
+        <item xmlns:dc="http://purl.org/dc/elements/1.1/">
+          <title>Migrated Paper</title>
+          <link>https://eprint.iacr.org/2026/1111</link>
+          <guid>https://eprint.iacr.org/2026/1111</guid>
+          <pubDate>Mon, 25 May 2026 09:00:00 +0000</pubDate>
+        </item>
+        """
+        mock_fetch.return_value = [ET.fromstring(xml_migrated)]
+        
+        mock_scrape.return_value = {
+            "modified_time": "2026-05-25T09:15:00+00:00",
+            "published_time": "2026-05-25T09:00:00+00:00"
+        }
+        
+        # Execute
+        eprint_bot.main()
+        
+        # Verify NO notifications were sent
+        mock_summarize.assert_not_called()
+        mock_post_discord.assert_not_called()
+        
+        # Verify scrape WAS called to populate the new date format
+        mock_scrape.assert_called_once_with("https://eprint.iacr.org/2026/1111")
+        
+        # Verify state now has the dictionary format with the populated date
+        state = eprint_bot.load_state()
+        self.assertEqual(state, {"https://eprint.iacr.org/2026/1111": "2026-05-25T09:15:00+00:00"})
 
 if __name__ == '__main__':
     unittest.main()
