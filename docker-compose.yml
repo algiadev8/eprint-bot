@@ -1,0 +1,12 @@
+services:
+  eprint-bot:
+    build: .
+    container_name: eprint-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - STATE_FILE=/app/data/state.json
+      - DAEMON_INTERVAL=10800  # Check every 10800 seconds (3 hours)
+    volumes:
+      - ./data:/app/data
