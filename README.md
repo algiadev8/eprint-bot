@@ -42,6 +42,19 @@ docker compose up -d
 - Logs can be checked via `docker compose logs -f`
 - The state is persisted in `./data/state.json`
 
+### Test notifications in production
+
+To verify the production Discord Webhook without fetching the RSS feed, calling
+the LLM, or changing `state.json`, run:
+
+```bash
+docker compose exec eprint-bot python eprint_bot.py --test-notification
+```
+
+This sends one clearly labeled dummy notification and exits. A delivery failure
+returns a non-zero exit status, so the command can also be used in deployment
+checks.
+
 ---
 
 ## 📄 License

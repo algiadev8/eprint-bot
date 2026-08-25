@@ -202,6 +202,47 @@ class TestEprintBot(unittest.TestCase):
         )
         self.assertNotIn("[Update]", content)
 
+    def test_build_discord_notification_labels_test_messages(self):
+        username, content = eprint_bot.build_discord_notification({
+            "title": "🧪 [TEST] ePrint Bot dummy notification",
+            "description": "Dummy content",
+        })
+
+        self.assertEqual(username, "🧪 テスト | ePrint Bot dummy notification")
+        self.assertEqual(content, "Dummy content")
+
+    @patch('eprint_bot.post_batches_to_discord')
+    def test_test_notification_only_requires_discord_and_sends_dummy(self, mock_post_discord):
+        mock_post_discord.return_value = True
+        eprint_bot.DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/test"
+        eprint_bot.LLM_API_URL = None
+        eprint_bot.LLM_API_KEY = None
+        eprint_bot.LLM_MODEL = None
+
+        eprint_bot.main(["--test-notification"])
+
+        mock_post_discord.assert_called_once()
+        test_embed = mock_post_discord.call_args.args[0][0]
+        self.assertIn("[TEST]", test_embed["title"])
+        self.assertIn("ダミー通知", test_embed["description"])
+
+    @patch('eprint_bot.run_bot_logic')
+    @patch('eprint_bot.send_test_notification')
+    def test_test_notification_skips_normal_bot_logic(self, mock_send_test, mock_run_bot):
+        eprint_bot.main(["--test-notification"])
+
+        mock_send_test.assert_called_once_with()
+        mock_run_bot.assert_not_called()
+
+    @patch('eprint_bot.post_batches_to_discord', return_value=False)
+    def test_test_notification_exits_nonzero_on_delivery_failure(self, _mock_post_discord):
+        eprint_bot.DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/test"
+
+        with self.assertRaises(SystemExit) as raised:
+            eprint_bot.main(["--test-notification"])
+
+        self.assertEqual(raised.exception.code, 1)
+
     @patch('eprint_bot.scrape_paper_metadata')
     @patch('eprint_bot.fetch_rss_feed')
     @patch('eprint_bot.summarize_abstract')

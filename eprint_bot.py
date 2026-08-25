@@ -11,6 +11,7 @@ import sys
 import time
 import json
 import logging
+import argparse
 import email.utils
 import re
 from datetime import datetime, timezone
@@ -47,22 +48,25 @@ NAMESPACES = {
     'content': 'http://purl.org/rss/1.0/modules/content/'
 }
 
-def validate_config():
+def validate_config(required=None):
     """Verify that all required environment variables are set."""
+    if required is None:
+        required = {
+            "DISCORD_WEBHOOK_URL": DISCORD_WEBHOOK_URL,
+            "LLM_API_URL": LLM_API_URL,
+            "LLM_API_KEY": LLM_API_KEY,
+            "LLM_MODEL": LLM_MODEL,
+        }
+
     missing = []
-    if not DISCORD_WEBHOOK_URL:
-        missing.append("DISCORD_WEBHOOK_URL")
-    if not LLM_API_URL:
-        missing.append("LLM_API_URL")
-    if not LLM_API_KEY:
-        missing.append("LLM_API_KEY")
-    if not LLM_MODEL:
-        missing.append("LLM_MODEL")
+    for name, value in required.items():
+        if not value:
+            missing.append(name)
         
     if missing:
         logger.error(f"Missing required environment variables: {', '.join(missing)}")
         logger.error("Please create a .env file based on .env.example with the correct values.")
-        sys.exit(1)
+        raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
 
 def load_state():
     """Load previously processed paper IDs/GUIDs from the state file."""
@@ -337,7 +341,10 @@ def build_discord_embed(paper, summary):
 def build_discord_notification(embed):
     """Build a plain Discord message that is useful in notification previews."""
     embed_title = embed.get("title", "Untitled")
-    if embed_title.startswith("🔄 [Update] "):
+    if embed_title.startswith("🧪 [TEST] "):
+        status = "🧪 テスト"
+        paper_title = embed_title.removeprefix("🧪 [TEST] ")
+    elif embed_title.startswith("🔄 [Update] "):
         status = "🔄 更新"
         paper_title = embed_title.removeprefix("🔄 [Update] ")
     else:
@@ -361,6 +368,7 @@ def build_discord_notification(embed):
 def post_batches_to_discord(embeds):
     """Post each paper as a plain message so push notifications are informative."""
     logger.info(f"Sending {len(embeds)} paper notification(s) to Discord...")
+    all_succeeded = True
 
     for embed in embeds:
         notification_title, content = build_discord_notification(embed)
@@ -374,6 +382,25 @@ def post_batches_to_discord(embeds):
             logger.info(f"Successfully posted to Discord: {notification_title}")
         except Exception as e:
             logger.error(f"Failed to post Discord notification: {e}")
+            all_succeeded = False
+
+    return all_succeeded
+
+def send_test_notification():
+    """Send one synthetic notification without touching RSS, LLM, or state."""
+    validate_config({"DISCORD_WEBHOOK_URL": DISCORD_WEBHOOK_URL})
+    sent_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    test_embed = {
+        "title": "🧪 [TEST] ePrint Bot dummy notification",
+        "description": (
+            "これは本番環境から送信したダミー通知です。"
+            "RSS取得・LLM要約・state更新は実行していません。"
+            f"\n\n送信時刻: {sent_at}"
+        ),
+    }
+    if not post_batches_to_discord([test_embed]):
+        raise RuntimeError("Test notification delivery failed")
+    logger.info("Test notification delivered successfully.")
 
 def run_bot_logic():
     processed_ids = load_state()
@@ -542,8 +569,27 @@ def run_bot_logic():
     save_state(processed_ids)
     logger.info("Done!")
 
-def main():
-    validate_config()
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="IACR ePrint notification bot")
+    parser.add_argument(
+        "--test-notification",
+        action="store_true",
+        help="send one dummy Discord notification and exit",
+    )
+    return parser.parse_args([] if argv is None else argv)
+
+def main(argv=None):
+    args = parse_args(argv)
+
+    try:
+        if args.test_notification:
+            send_test_notification()
+            return
+
+        validate_config()
+    except (ValueError, RuntimeError) as e:
+        logger.error(str(e))
+        raise SystemExit(1) from e
     
     daemon_interval_str = os.getenv("DAEMON_INTERVAL")
     if daemon_interval_str:
@@ -569,4 +615,4 @@ def main():
         run_bot_logic()
 
 if __name__ == "__main__":
-    main()
+    main(sys.argv[1:])
