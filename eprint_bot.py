@@ -334,49 +334,46 @@ def build_discord_embed(paper, summary):
     }
     return embed
 
+def build_discord_notification(embed):
+    """Build a plain Discord message that is useful in notification previews."""
+    embed_title = embed.get("title", "Untitled")
+    if embed_title.startswith("🔄 [Update] "):
+        status = "🔄 更新"
+        paper_title = embed_title.removeprefix("🔄 [Update] ")
+    else:
+        status = "🆕 新着"
+        paper_title = embed_title
+
+    # Discord displays the webhook name as the notification title. Its limit
+    # is 80 characters, so retain the status even when a paper title is long.
+    notification_title = f"{status} | {paper_title}"[:80]
+
+    summary = embed.get("description", "")
+    link = embed.get("url", "")
+    content = summary
+    if link:
+        content = f"{content}\n\n{link}" if content else link
+    if len(content) > 2000:
+        content = content[:1999] + "…"
+
+    return notification_title, content
+
 def post_batches_to_discord(embeds):
-    """Post multiple embeds to the Discord webhook, batching to respect API limits."""
-    # Discord limits:
-    # - Max 10 embeds per message payload.
-    # - Max 6000 characters total across the entire message object.
-    
-    batches = []
-    current_batch = []
-    current_char_count = 0
-    
+    """Post each paper as a plain message so push notifications are informative."""
+    logger.info(f"Sending {len(embeds)} paper notification(s) to Discord...")
+
     for embed in embeds:
-        # Calculate approximate character size of the embed
-        embed_size = len(embed.get('title', '')) + len(embed.get('description', ''))
-        for field in embed.get('fields', []):
-            embed_size += len(field.get('name', '')) + len(field.get('value', ''))
-        if embed.get('footer', {}).get('text'):
-            embed_size += len(embed['footer']['text'])
-            
-        # If adding this embed exceeds limits, start a new batch
-        if len(current_batch) >= 10 or (current_char_count + embed_size) > 5500:
-            batches.append(current_batch)
-            current_batch = [embed]
-            current_char_count = embed_size
-        else:
-            current_batch.append(embed)
-            current_char_count += embed_size
-            
-    if current_batch:
-        batches.append(current_batch)
-        
-    logger.info(f"Consolidating embeds. Sending {len(embeds)} embeds in {len(batches)} post(s)...")
-    
-    for idx, batch in enumerate(batches, 1):
+        notification_title, content = build_discord_notification(embed)
         payload = {
-            "content": f"📢 **IACR ePrint New Submissions & Updates Notification** (Part {idx}/{len(batches)})" if len(batches) > 1 else "📢 **IACR ePrint New Submissions & Updates Notification**",
-            "embeds": batch
+            "username": notification_title,
+            "content": content,
         }
         try:
             response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=20)
             response.raise_for_status()
-            logger.info(f"Batch {idx} successfully posted to Discord.")
+            logger.info(f"Successfully posted to Discord: {notification_title}")
         except Exception as e:
-            logger.error(f"Failed to post batch {idx} to Discord Webhook: {e}")
+            logger.error(f"Failed to post Discord notification: {e}")
 
 def run_bot_logic():
     processed_ids = load_state()

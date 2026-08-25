@@ -177,15 +177,30 @@ class TestEprintBot(unittest.TestCase):
         
         eprint_bot.post_batches_to_discord(embeds)
         
-        # Verify requests.post was called twice
-        self.assertEqual(mock_post.call_count, 2)
-        
-        # Verify first call had 10 embeds, second had 2 embeds
+        # Each paper gets its own message so its title and summary appear in
+        # the push notification.
+        self.assertEqual(mock_post.call_count, 12)
+
         first_call_json = mock_post.call_args_list[0][1]["json"]
-        second_call_json = mock_post.call_args_list[1][1]["json"]
-        
-        self.assertEqual(len(first_call_json["embeds"]), 10)
-        self.assertEqual(len(second_call_json["embeds"]), 2)
+        self.assertEqual(first_call_json["username"], "🆕 新着 | Paper 0")
+        self.assertEqual(first_call_json["content"], "Summary 0")
+        self.assertNotIn("embeds", first_call_json)
+
+    def test_build_discord_notification_distinguishes_updates(self):
+        embed = {
+            "title": "🔄 [Update] A Revised Paper",
+            "description": "The revised result.",
+            "url": "https://eprint.iacr.org/2026/1",
+        }
+
+        username, content = eprint_bot.build_discord_notification(embed)
+
+        self.assertEqual(username, "🔄 更新 | A Revised Paper")
+        self.assertEqual(
+            content,
+            "The revised result.\n\nhttps://eprint.iacr.org/2026/1",
+        )
+        self.assertNotIn("[Update]", content)
 
     @patch('eprint_bot.scrape_paper_metadata')
     @patch('eprint_bot.fetch_rss_feed')
