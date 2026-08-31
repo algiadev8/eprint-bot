@@ -34,6 +34,8 @@ load_dotenv()
 
 # Configuration settings
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+DISCORD_NEW_WEBHOOK_URL = os.getenv("DISCORD_NEW_WEBHOOK_URL")
+DISCORD_UPDATE_WEBHOOK_URL = os.getenv("DISCORD_UPDATE_WEBHOOK_URL")
 LLM_API_URL = os.getenv("LLM_API_URL")
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 LLM_MODEL = os.getenv("LLM_MODEL")
@@ -52,7 +54,12 @@ def validate_config(required=None):
     """Verify that all required environment variables are set."""
     if required is None:
         required = {
-            "DISCORD_WEBHOOK_URL": DISCORD_WEBHOOK_URL,
+            "Discord webhook (DISCORD_NEW_WEBHOOK_URL or DISCORD_WEBHOOK_URL)": (
+                DISCORD_NEW_WEBHOOK_URL or DISCORD_WEBHOOK_URL
+            ),
+            "Discord webhook (DISCORD_UPDATE_WEBHOOK_URL or DISCORD_WEBHOOK_URL)": (
+                DISCORD_UPDATE_WEBHOOK_URL or DISCORD_WEBHOOK_URL
+            ),
             "LLM_API_URL": LLM_API_URL,
             "LLM_API_KEY": LLM_API_KEY,
             "LLM_MODEL": LLM_MODEL,
@@ -365,6 +372,13 @@ def build_discord_notification(embed):
 
     return notification_title, content
 
+def get_discord_webhook_url(embed):
+    """Select a Discord webhook based on the notification type."""
+    title = embed.get("title", "")
+    if title.startswith("🔄 [Update] "):
+        return DISCORD_UPDATE_WEBHOOK_URL or DISCORD_WEBHOOK_URL
+    return DISCORD_NEW_WEBHOOK_URL or DISCORD_WEBHOOK_URL
+
 def post_batches_to_discord(embeds):
     """Post each paper as a plain message so push notifications are informative."""
     logger.info(f"Sending {len(embeds)} paper notification(s) to Discord...")
@@ -372,12 +386,19 @@ def post_batches_to_discord(embeds):
 
     for embed in embeds:
         notification_title, content = build_discord_notification(embed)
+        webhook_url = get_discord_webhook_url(embed)
+        if not webhook_url:
+            logger.error(
+                f"No Discord webhook configured for notification: {notification_title}"
+            )
+            all_succeeded = False
+            continue
         payload = {
             "username": notification_title,
             "content": content,
         }
         try:
-            response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=20)
+            response = requests.post(webhook_url, json=payload, timeout=20)
             response.raise_for_status()
             logger.info(f"Successfully posted to Discord: {notification_title}")
         except Exception as e:
@@ -388,7 +409,11 @@ def post_batches_to_discord(embeds):
 
 def send_test_notification():
     """Send one synthetic notification without touching RSS, LLM, or state."""
-    validate_config({"DISCORD_WEBHOOK_URL": DISCORD_WEBHOOK_URL})
+    validate_config({
+        "DISCORD_NEW_WEBHOOK_URL or DISCORD_WEBHOOK_URL": (
+            DISCORD_NEW_WEBHOOK_URL or DISCORD_WEBHOOK_URL
+        )
+    })
     sent_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     test_embed = {
         "title": "🧪 [TEST] ePrint Bot dummy notification",

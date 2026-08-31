@@ -8,6 +8,7 @@ A Python-based automation bot that monitors the [IACR Cryptology ePrint Archive]
 - **OpenAI-Compatible API**: Works natively with OpenAI, DeepSeek, Gemini, or local LLMs.
 - **Date-filtered First Run**: Prevents bulk LLM API costs on first startup.
 - **State Persistence**: Remembers processed papers in `state.json`.
+- **Separate Discord Channels**: Routes new papers and paper updates to different webhooks.
 
 ---
 
@@ -18,6 +19,17 @@ Copy `.env.example` to `.env` and fill in your keys:
 ```bash
 cp .env.example .env
 ```
+
+To separate notifications into two Discord channels, create a webhook in each
+channel and configure both URLs:
+
+```dotenv
+DISCORD_NEW_WEBHOOK_URL=https://discord.com/api/webhooks/...
+DISCORD_UPDATE_WEBHOOK_URL=https://discord.com/api/webhooks/...
+```
+
+The existing `DISCORD_WEBHOOK_URL` remains available as a fallback for either
+notification type, so a single-channel configuration continues to work.
 
 ### 2. Run with `uv`
 Ensure you have [uv](https://github.com/astral-sh/uv) installed, then run:

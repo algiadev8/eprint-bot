@@ -169,6 +169,8 @@ class TestEprintBot(unittest.TestCase):
         mock_post.return_value = mock_response
         
         eprint_bot.DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/test"
+        eprint_bot.DISCORD_NEW_WEBHOOK_URL = None
+        eprint_bot.DISCORD_UPDATE_WEBHOOK_URL = None
         
         embeds = [
             {"title": f"Paper {i}", "description": f"Summary {i}"}
@@ -185,6 +187,21 @@ class TestEprintBot(unittest.TestCase):
         self.assertEqual(first_call_json["username"], "🆕 新着 | Paper 0")
         self.assertEqual(first_call_json["content"], "Summary 0")
         self.assertNotIn("embeds", first_call_json)
+
+    @patch('requests.post')
+    def test_post_batches_routes_new_and_updates_to_separate_webhooks(self, mock_post):
+        mock_post.return_value = MagicMock(status_code=204)
+        eprint_bot.DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/fallback"
+        eprint_bot.DISCORD_NEW_WEBHOOK_URL = "https://discord.com/api/webhooks/new"
+        eprint_bot.DISCORD_UPDATE_WEBHOOK_URL = "https://discord.com/api/webhooks/update"
+
+        eprint_bot.post_batches_to_discord([
+            {"title": "A New Paper", "description": "New summary"},
+            {"title": "🔄 [Update] A Revised Paper", "description": "Update summary"},
+        ])
+
+        self.assertEqual(mock_post.call_args_list[0].args[0], eprint_bot.DISCORD_NEW_WEBHOOK_URL)
+        self.assertEqual(mock_post.call_args_list[1].args[0], eprint_bot.DISCORD_UPDATE_WEBHOOK_URL)
 
     def test_build_discord_notification_distinguishes_updates(self):
         embed = {
