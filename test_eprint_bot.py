@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# /// script
+# requires-python = ">=3.9"
+# dependencies = ["requests>=2.31.0", "python-dotenv>=1.0.0"]
+# ///
 """Offline regressions: never load production state, contact LLM or Discord."""
 import json
 import os
