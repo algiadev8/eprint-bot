@@ -9,7 +9,10 @@ WORKDIR /app
 COPY eprint_bot.py requirements.txt ./
 
 # Install dependencies system-wide in container using uv (ultra fast)
-RUN uv pip install --system --no-cache -r requirements.txt
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/browsers
+RUN uv pip install --system --no-cache -r requirements.txt \
+    && python -m playwright install --with-deps chromium \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create directory to mount persistent volumes (to save state.json)
 RUN mkdir -p /app/data

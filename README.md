@@ -6,6 +6,7 @@ A Python-based automation bot that monitors the [IACR Cryptology ePrint Archive]
 
 - **Per-paper Notifications**: Sends each summary with a useful notification preview.
 - **OpenAI-Compatible API**: Works natively with OpenAI, DeepSeek, Gemini, or local LLMs.
+- **Cloudflare-aware Fetching**: RSS and article pages use Scrapling 0.5 `StealthySession` with Chromium and `solve_cloudflare=True`.
 - **Date-filtered First Run**: Prevents bulk LLM API costs on first startup.
 - **State Persistence**: Remembers processed papers in `state.json`.
 - **Separate Discord Channels**: Routes original publications and revisions to different webhooks using the article's original/modified dates, not whether its ID is known.
@@ -21,6 +22,14 @@ modification instant advances; timezone offsets are normalized to UTC.
 Missing/invalid article dates are deferred rather than guessed from RSS pubDate.
 Page requests are spaced by at least five seconds. HTTP 429/503 stops further
 page requests in that scan; remaining entries stay pending for the next run.
+Each scan lazily opens one headless Chromium session and shares cookies across
+RSS and article requests; the browser is closed after the scan, including on
+errors. Sessions are not saved into the notification state file. Fetches use a
+60-second browser timeout and no application-level rapid retries. Unresolved
+Cloudflare challenge pages (including HTTP 200 challenges) are rejected, not
+interpreted as RSS or publication metadata. Cloudflare clearance is not guaranteed;
+failed scans are retried on the normal daemon interval. RSS failures no longer
+terminate the daemon. LLM and Discord requests continue to use `requests`.
 The first run baselines older publication days and notifies only the latest
 publication day (today if present). Existing list-format state is migrated without
 re-notifying known IDs.
@@ -63,6 +72,14 @@ The existing `DISCORD_WEBHOOK_URL` remains available as a fallback for either
 notification type, so a single-channel configuration continues to work.
 
 ### 2. Run with `uv`
+Requires Python 3.10+ and Chromium's system libraries. Docker installs these
+at build time and is recommended for production. For a host installation, first
+install the browser and system dependencies (OS installation requires root):
+
+```bash
+uv run --with 'scrapling[fetchers]==0.5' playwright install --with-deps chromium
+```
+
 Ensure you have [uv](https://github.com/astral-sh/uv) installed, then run:
 ```bash
 # Run the bot
@@ -80,7 +97,7 @@ uv run test_eprint_bot.py
 You can run the bot in persistent Daemon Mode:
 
 ```bash
-docker compose up -d
+docker compose up -d --build
 ```
 - Logs can be checked via `docker compose logs -f`
 - The state is persisted in `./data/state.json`

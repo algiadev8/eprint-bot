@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 # /// script
-# requires-python = ">=3.9"
+# requires-python = ">=3.10"
 # dependencies = [
 #     "requests>=2.31.0",
 #     "python-dotenv>=1.0.0",
+#     "scrapling[fetchers]==0.5",
 # ]
 # ///
 import os
@@ -16,11 +17,14 @@ import email.utils
 import tempfile
 import fcntl
 from contextlib import contextmanager
+from contextvars import ContextVar
+from urllib.parse import urlsplit
 from html.parser import HTMLParser
 from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
 import requests
 from dotenv import load_dotenv
+from scrapling.fetchers import StealthySession
 
 # Set up logging
 logging.basicConfig(
@@ -114,6 +118,73 @@ class FeedRateLimited(RuntimeError):
     """Stop this scan when ePrint asks clients to back off."""
 
 
+class FeedUnavailable(RuntimeError):
+    """An unsuccessful/challenge response is not ePrint content."""
+
+
+class EprintClient:
+    """Lazily start one Chromium session per scan, sharing challenge cookies."""
+    def __init__(self):
+        self.session = None
+
+    def fetch(self, url):
+        if urlsplit(url).scheme != "https" or urlsplit(url).netloc != "eprint.iacr.org":
+            raise FeedUnavailable("Unexpected ePrint URL")
+        if self.session is None:
+            session = StealthySession(
+                headless=True, solve_cloudflare=True, timeout=60000,
+                retries=1, max_pages=1, google_search=False,
+            )
+            session.__enter__()
+            self.session = session
+        response = self.session.fetch(url)
+        if response.status in (429, 503):
+            raise FeedRateLimited("ePrint rate limited the scan; defer remaining entries")
+        if response.status != 200:
+            raise FeedUnavailable(f"ePrint returned HTTP {response.status}")
+        if urlsplit(response.url).netloc != "eprint.iacr.org":
+            raise FeedUnavailable("Unexpected redirect away from ePrint")
+        body = response.body
+        # A challenge can return HTTP 200. Never parse it as a feed/article.
+        lowered = body.lower()
+        if any(marker in lowered for marker in (
+            b"cf-chl-", b"challenges.cloudflare.com", b"<title>just a moment",
+        )):
+            raise FeedUnavailable("Cloudflare challenge remains unresolved")
+        return body
+
+    def close(self):
+        if self.session is not None:
+            try:
+                self.session.__exit__(None, None, None)
+            finally:
+                self.session = None
+
+
+_active_eprint_client = ContextVar("eprint_client", default=None)
+
+
+@contextmanager
+def eprint_client():
+    client = EprintClient()
+    token = _active_eprint_client.set(client)
+    try:
+        yield client
+    finally:
+        try:
+            client.close()
+        finally:
+            _active_eprint_client.reset(token)
+
+
+def fetch_eprint(url):
+    client = _active_eprint_client.get()
+    if client is not None:
+        return client.fetch(url)
+    with eprint_client() as client:
+        return client.fetch(url)
+
+
 class ArticleMetadataParser(HTMLParser):
     def __init__(self):
         super().__init__()
@@ -160,15 +231,8 @@ def scrape_paper_metadata(url):
         "published_time": ISO 8601 string or None
     """
     logger.info(f"Scraping metadata from {url}...")
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
     try:
-        response = requests.get(url, headers=headers, timeout=15)
-        if response.status_code in (429, 503):
-            raise FeedRateLimited("ePrint rate limited the scan; defer remaining entries")
-        response.raise_for_status()
-        html = response.text
+        html = fetch_eprint(url).decode("utf-8")
         
         parser = ArticleMetadataParser()
         parser.feed(html)
@@ -192,16 +256,16 @@ def fetch_rss_feed():
     """Fetch and parse the ePrint RSS feed."""
     logger.info(f"Fetching RSS feed from {EPRINT_RSS_URL}...")
     try:
-        response = requests.get(EPRINT_RSS_URL, timeout=30)
-        response.raise_for_status()
-        # Parse XML content natively
-        root = ET.fromstring(response.content)
+        # Scrapling preserves the raw XML body, not Chromium's XML viewer DOM.
+        root = ET.fromstring(fetch_eprint(EPRINT_RSS_URL))
+        if root.tag != "rss":
+            raise FeedUnavailable("Expected an RSS document from ePrint")
         items = root.findall('.//item')
         logger.info(f"Successfully fetched RSS feed containing {len(items)} items.")
         return items
     except Exception as e:
         logger.error(f"Error fetching or parsing RSS feed: {e}")
-        sys.exit(1)
+        raise FeedUnavailable("Unable to fetch a valid ePrint RSS feed") from e
 
 def parse_item(item):
     """Extract clean metadata from an XML <item> element."""
@@ -478,7 +542,7 @@ def send_test_notification():
     logger.info("Test notification delivered successfully.")
 
 def run_bot_logic(dry_run=False):
-    with state_lock():
+    with state_lock(), eprint_client():
         _run_bot_logic(dry_run=dry_run)
 
 

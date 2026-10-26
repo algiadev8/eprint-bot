@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # /// script
-# requires-python = ">=3.9"
-# dependencies = ["requests>=2.31.0", "python-dotenv>=1.0.0"]
+# requires-python = ">=3.10"
+# dependencies = ["requests>=2.31.0", "python-dotenv>=1.0.0", "scrapling[fetchers]==0.5"]
 # ///
 """Offline regressions: never load production state, contact LLM or Discord."""
 import json
@@ -231,21 +231,93 @@ class BotTests(unittest.TestCase):
         self.assertEqual(parsed["abstract"], "Abstract")
 
 
+class EprintTransportTests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch('eprint_bot.StealthySession')
+        self.factory = patcher.start()
+        self.addCleanup(patcher.stop)
+        self.session = self.factory.return_value
+        self.session.fetch.return_value = MagicMock(
+            status=200, url=TARGET, body=b'<rss><channel /></rss>')
+
+    def test_browser_reused_and_closed(self):
+        with bot.eprint_client():
+            bot.fetch_eprint(TARGET)
+            bot.fetch_eprint(TARGET)
+        self.factory.assert_called_once_with(
+            headless=True, solve_cloudflare=True, timeout=60000,
+            retries=1, max_pages=1, google_search=False)
+        self.assertEqual(self.session.fetch.call_count, 2)
+        self.session.__exit__.assert_called_once()
+        self.assertIsNone(bot._active_eprint_client.get())
+
+    def test_session_is_lazy(self):
+        with bot.eprint_client():
+            pass
+        self.factory.assert_not_called()
+
+    def test_session_closed_after_exception(self):
+        self.session.fetch.side_effect = TimeoutError('browser timed out')
+        with self.assertRaises(TimeoutError):
+            bot.fetch_eprint(TARGET)
+        self.session.__exit__.assert_called_once()
+        self.assertIsNone(bot._active_eprint_client.get())
+
+    def test_rate_limits_deferred(self):
+        for status in (429, 503):
+            self.session.fetch.return_value.status = status
+            with self.assertRaises(bot.FeedRateLimited):
+                bot.fetch_eprint(TARGET)
+
+    def test_http_errors_rejected(self):
+        self.session.fetch.return_value.status = 403
+        with self.assertRaises(bot.FeedUnavailable):
+            bot.fetch_eprint(TARGET)
+
+    def test_http_200_challenge_rejected(self):
+        self.session.fetch.return_value.body = b'<html><title>Just a moment...</title></html>'
+        with self.assertRaises(bot.FeedUnavailable):
+            bot.fetch_eprint(TARGET)
+
+    def test_external_url_rejected(self):
+        with self.assertRaises(bot.FeedUnavailable):
+            bot.fetch_eprint('https://example.com/')
+        self.factory.assert_not_called()
+
+    def test_external_redirect_rejected(self):
+        self.session.fetch.return_value.url = 'https://example.com/'
+        with self.assertRaises(bot.FeedUnavailable):
+            bot.fetch_eprint(TARGET)
+
+    def test_rss_raw_xml_parsed(self):
+        self.session.fetch.return_value.body = (
+            b'<?xml version="1.0"?><rss><channel><item><title>Test</title></item></channel></rss>')
+        self.assertEqual(len(bot.fetch_rss_feed()), 1)
+
+    def test_invalid_feed_raises_not_system_exit(self):
+        self.session.fetch.return_value.body = b'<html>Blocked</html>'
+        with self.assertRaises(bot.FeedUnavailable):
+            bot.fetch_rss_feed()
+
+    def test_failed_challenge_does_not_invent_article_dates(self):
+        self.session.fetch.return_value.status = 403
+        self.assertEqual(bot.scrape_paper_metadata(TARGET), {
+            'published_time': None, 'modified_time': None})
+
+
 eprint_bot = bot
 
 class LegacyApiTests(unittest.TestCase):
 
-    @patch('requests.get')
+    @patch('eprint_bot.fetch_eprint', side_effect=bot.FeedRateLimited('slow down'))
     def test_http_rate_limit_stops_scan(self, get):
-        get.return_value.status_code = 429
         with self.assertRaises(bot.FeedRateLimited):
             bot.scrape_paper_metadata(TARGET)
 
-    @patch('requests.get')
+    @patch('eprint_bot.fetch_eprint')
     def test_scrape_metadata_attribute_order(self, get):
-        get.return_value.status_code = 200
-        get.return_value.text = (f'<meta content="{PUB}" property="article:published_time">'
-                                 f'<meta property="article:modified_time" content="{MOD}">')
+        get.return_value = (f'<meta content="{PUB}" property="article:published_time">'
+                           f'<meta property="article:modified_time" content="{MOD}">').encode()
         self.assertEqual(bot.scrape_paper_metadata(TARGET), {
             "published_time": PUB, "modified_time": MOD})
 
