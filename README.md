@@ -4,11 +4,42 @@ A Python-based automation bot that monitors the [IACR Cryptology ePrint Archive]
 
 ## ✨ Features
 
-- **Consolidated Posts**: Aggregates new papers to avoid spamming the Discord channel.
+- **Per-paper Notifications**: Sends each summary with a useful notification preview.
 - **OpenAI-Compatible API**: Works natively with OpenAI, DeepSeek, Gemini, or local LLMs.
 - **Date-filtered First Run**: Prevents bulk LLM API costs on first startup.
 - **State Persistence**: Remembers processed papers in `state.json`.
-- **Separate Discord Channels**: Routes new papers and paper updates to different webhooks.
+- **Separate Discord Channels**: Routes original publications and revisions to different webhooks using the article's original/modified dates, not whether its ID is known.
+- **Complete Feed Scan**: Checks every RSS entry, including pending deliveries after known entries.
+- **Reliable State**: Checkpoints individual successful deliveries atomically; failed deliveries remain pending. Corrupt state aborts the run rather than replaying the feed. A file lock prevents concurrent runs sharing a state file.
+
+### Notification semantics
+
+An unseen article with a modification time later than its original publication is
+an **update**, including old papers reappearing in RSS (e.g. `2026/537`). An
+unseen original version is **new**. Known articles are notified only when the
+modification instant advances; timezone offsets are normalized to UTC.
+Missing/invalid article dates are deferred rather than guessed from RSS pubDate.
+Page requests are spaced by at least five seconds. HTTP 429/503 stops further
+page requests in that scan; remaining entries stay pending for the next run.
+The first run baselines older publication days and notifies only the latest
+publication day (today if present). Existing list-format state is migrated without
+re-notifying known IDs.
+
+Successful deliveries are saved one at a time. Delivery is **at least once**:
+a crash after Discord accepts a message but before its checkpoint may cause a
+retry. RSS only contains a limited recent window, so entries no longer in the
+feed cannot be recovered automatically. Existing historical mislabels are not
+resent or rewritten.
+
+Preview a full scan without calling the LLM, posting to Discord, or changing state:
+
+```sh
+docker compose exec eprint-bot python eprint_bot.py --dry-run
+```
+
+The preview shares the state lock; run it between scheduled scans. Do not delete
+state to troubleshoot: preserve `data/state.json` and inspect logs instead.
+Unit tests use isolated temporary state and mocked network calls.
 
 ---
 

@@ -13,7 +13,10 @@ import json
 import logging
 import argparse
 import email.utils
-import re
+import tempfile
+import fcntl
+from contextlib import contextmanager
+from html.parser import HTMLParser
 from datetime import datetime, timezone
 import xml.etree.ElementTree as ET
 import requests
@@ -77,32 +80,77 @@ def validate_config(required=None):
 
 def load_state():
     """Load previously processed paper IDs/GUIDs from the state file."""
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, 'r', encoding='utf-8') as f:
-                state = json.load(f)
-                processed = state.get("processed_ids", [])
-                
-                # Support backwards compatibility and migration
-                if isinstance(processed, list):
-                    logger.info("Migrating state file from old list format to dictionary format...")
-                    return {guid: "" for guid in processed}
-                elif isinstance(processed, dict):
-                    return processed
-                else:
-                    logger.warning(f"Unexpected processed_ids type: {type(processed)}. Starting fresh.")
-        except Exception as e:
-            logger.warning(f"Failed to load state file ({e}). Starting fresh.")
-    return {}
+    if not os.path.exists(STATE_FILE):
+        return {}
+    # Fail closed: damaged/unreadable state must never trigger a mass replay.
+    with open(STATE_FILE, 'r', encoding='utf-8') as f:
+        state = json.load(f)
+    processed = state["processed_ids"]
+    if isinstance(processed, list) and all(isinstance(k, str) for k in processed):
+        return {guid: "" for guid in processed}
+    if isinstance(processed, dict) and all(
+        isinstance(k, str) and isinstance(v, str) for k, v in processed.items()
+    ):
+        return processed
+    raise ValueError("Invalid processed_ids in state file")
 
 def save_state(processed_dict):
     """Save processed paper IDs/GUIDs with their modified times to the state file."""
+    directory = os.path.dirname(os.path.abspath(STATE_FILE))
+    fd, temporary = tempfile.mkstemp(prefix=".state-", suffix=".tmp", dir=directory)
     try:
-        with open(STATE_FILE, 'w', encoding='utf-8') as f:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
             json.dump({"processed_ids": processed_dict}, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, STATE_FILE)
         logger.info(f"Saved {len(processed_dict)} processed IDs to {STATE_FILE}.")
-    except Exception as e:
-        logger.error(f"Failed to save state file: {e}")
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+class FeedRateLimited(RuntimeError):
+    """Stop this scan when ePrint asks clients to back off."""
+
+
+class ArticleMetadataParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.metadata = {}
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "meta" and attrs.get("property") in (
+            "article:modified_time", "article:published_time"
+        ):
+            self.metadata[attrs["property"]] = attrs.get("content")
+
+
+def parse_timestamp(value):
+    """Compare instants, not ISO strings with potentially different offsets."""
+    if not value:
+        return None
+    try:
+        result = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if result.tzinfo is None:
+            return None
+        return result.astimezone(timezone.utc)
+    except (ValueError, TypeError):
+        return None
+
+
+@contextmanager
+def state_lock():
+    with open(STATE_FILE + ".lock", "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise RuntimeError("Another bot process is using this state file")
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
 
 def scrape_paper_metadata(url):
     """Scrape the ePrint page to extract modified_time and published_time.
@@ -117,20 +165,22 @@ def scrape_paper_metadata(url):
     }
     try:
         response = requests.get(url, headers=headers, timeout=15)
+        if response.status_code in (429, 503):
+            raise FeedRateLimited("ePrint rate limited the scan; defer remaining entries")
         response.raise_for_status()
         html = response.text
         
-        # Regex search for article:modified_time and article:published_time
-        modified_match = re.search(r'<meta\s+property=["\']article:modified_time["\']\s+content=["\']([^"\']+)["\']', html)
-        published_match = re.search(r'<meta\s+property=["\']article:published_time["\']\s+content=["\']([^"\']+)["\']', html)
-        
-        modified_time = modified_match.group(1) if modified_match else None
-        published_time = published_match.group(1) if published_match else None
+        parser = ArticleMetadataParser()
+        parser.feed(html)
+        modified_time = parser.metadata.get("article:modified_time")
+        published_time = parser.metadata.get("article:published_time")
         
         return {
             "modified_time": modified_time,
             "published_time": published_time
         }
+    except FeedRateLimited:
+        raise
     except Exception as e:
         logger.warning(f"Failed to scrape metadata from {url}: {e}")
         return {
@@ -402,7 +452,7 @@ def post_batches_to_discord(embeds):
             response.raise_for_status()
             logger.info(f"Successfully posted to Discord: {notification_title}")
         except Exception as e:
-            logger.error(f"Failed to post Discord notification: {e}")
+            logger.error("Failed to post Discord notification (%s); retry next run", type(e).__name__)
             all_succeeded = False
 
     return all_succeeded
@@ -427,175 +477,94 @@ def send_test_notification():
         raise RuntimeError("Test notification delivery failed")
     logger.info("Test notification delivered successfully.")
 
-def run_bot_logic():
+def run_bot_logic(dry_run=False):
+    with state_lock():
+        _run_bot_logic(dry_run=dry_run)
+
+
+def _run_bot_logic(dry_run=False):
+    is_first_run = not os.path.exists(STATE_FILE)
     processed_ids = load_state()
-    is_first_run = len(processed_ids) == 0
-    
-    raw_items = fetch_rss_feed()
-    all_papers = [parse_item(item) for item in raw_items]
-    
-    new_papers = []
-    has_changes = False
-    
-    if is_first_run:
-        logger.info(f"First run: Initializing processed_ids with exact metadata for {len(all_papers)} papers in the feed...")
-        parsed_papers = []
-        for idx, paper in enumerate(all_papers):
-            logger.info(f"[{idx+1}/{len(all_papers)}] Initializing paper metadata...")
-            guid = paper["guid"]
-            link = paper["link"]
-            
-            scraped_mod = None
-            scraped_pub = None
-            if link:
-                metadata = scrape_paper_metadata(link)
-                scraped_mod = metadata["modified_time"]
-                scraped_pub = metadata["published_time"]
-                time.sleep(1.0) # Polite sequential sleep
-            
-            if not scraped_pub:
-                try:
-                    pub_dt = email.utils.parsedate_to_datetime(paper["pub_date_str"])
-                    scraped_pub = pub_dt.astimezone(timezone.utc).isoformat()
-                except Exception:
-                    pass
-            if not scraped_mod:
-                scraped_mod = scraped_pub
-                
-            paper["scraped_published_time"] = scraped_pub
-            paper["scraped_modified_time"] = scraped_mod
-            
-            # Format date to match format "YYYY-MM-DD"
-            paper_date_str = ""
-            if scraped_pub:
-                try:
-                    paper_date_str = scraped_pub.split('T')[0]
-                except Exception:
-                    pass
-            
-            parsed_papers.append((paper, paper_date_str))
-            
-        # Determine the target date: try today first, otherwise fall back to the newest date in the feed
-        now_utc = datetime.now(timezone.utc)
-        current_date_str = now_utc.strftime('%Y-%m-%d')
-        
-        has_today_papers = any(date_str == current_date_str for _, date_str in parsed_papers if date_str)
-        
-        if has_today_papers:
-            target_date_str = current_date_str
-            logger.info(f"First run: Found papers published today: {target_date_str} (UTC).")
-        else:
-            valid_dates = [date_str for _, date_str in parsed_papers if date_str]
-            newest_paper_date = max(valid_dates) if valid_dates else None
-            
-            if newest_paper_date:
-                target_date_str = newest_paper_date
-                logger.info(f"First run: No papers published today ({current_date_str}). Falling back to the most recent date in the feed: {target_date_str} (UTC).")
-            else:
-                target_date_str = current_date_str
-                logger.warning("First run: Could not determine any publication dates in the feed. Defaulting to today's date.")
-                
-        # Filter papers based on the determined target date
-        for paper, date_str in parsed_papers:
-            guid = paper["guid"]
-            scraped_mod = paper.get("scraped_modified_time")
-            if date_str == target_date_str:
-                paper["is_update"] = False
-                new_papers.append(paper)
-            
-            # Mark all papers (including target and skipped) as processed with their actual scraped times
-            processed_ids[guid] = scraped_mod if scraped_mod else ""
-            has_changes = True
-            
-        logger.info(f"First run: Processing {len(new_papers)} paper(s) published on {target_date_str}. Marking {len(all_papers) - len(new_papers)} other papers as processed.")
-    else:
-        # Standard Run: Check if paper guid is not in processed list, handles updates & migration
-        for idx, paper in enumerate(all_papers):
-            guid = paper["guid"]
-            link = paper["link"]
-            if not link:
-                continue
-                
-            in_state = guid in processed_ids
-            stored_mod = processed_ids.get(guid, None)
-            is_migrated = in_state and stored_mod == ""
-            
-            # Scrape page
-            metadata = scrape_paper_metadata(link)
-            scraped_mod = metadata["modified_time"]
-            scraped_pub = metadata["published_time"]
-            time.sleep(1.0) # Polite sequential sleep
-            
-            if not scraped_pub:
-                try:
-                    pub_dt = email.utils.parsedate_to_datetime(paper["pub_date_str"])
-                    scraped_pub = pub_dt.astimezone(timezone.utc).isoformat()
-                except Exception:
-                    pass
-            if not scraped_mod:
-                scraped_mod = scraped_pub
-                
-            if not scraped_mod:
-                logger.warning(f"Could not retrieve modification time for {guid}. Skipping in this run.")
-                continue
-                
-            # If completely new to state
-            if not in_state:
-                paper["scraped_published_time"] = scraped_pub
-                paper["scraped_modified_time"] = scraped_mod
-                paper["is_update"] = False
-                new_papers.append(paper)
-                
-                processed_ids[guid] = scraped_mod
-                has_changes = True
-                logger.info(f"Found new paper: {paper['title']}")
-                
-            # If in state but migrated (no date stored)
-            elif is_migrated:
-                logger.info(f"Populated migration date for already processed paper: {guid}")
-                processed_ids[guid] = scraped_mod
-                has_changes = True
-                
-            # If in state with stored date
-            else:
-                if scraped_mod > stored_mod:
-                    paper["scraped_published_time"] = scraped_pub
-                    paper["scraped_modified_time"] = scraped_mod
-                    paper["is_update"] = True
-                    new_papers.append(paper)
-                    
-                    processed_ids[guid] = scraped_mod
-                    has_changes = True
-                    logger.info(f"Found updated paper: {paper['title']} (New: {scraped_mod}, Old: {stored_mod})")
-                else:
-                    # Optimization Stop!
-                    logger.info(f"Reached already processed paper ({guid}) with no new updates. Stopping feed scan.")
-                    break
-                    
-    if not new_papers:
-        logger.info("No new papers found to process.")
-        if has_changes:
+    papers = []
+    seen = set()
+    for item in fetch_rss_feed():
+        paper = parse_item(item)
+        guid = paper["guid"]
+        if not guid or not paper["link"] or guid in seen:
+            continue
+        seen.add(guid)
+        try:
+            metadata = scrape_paper_metadata(paper["link"])
+        except FeedRateLimited as exc:
+            logger.warning("%s", exc)
+            break
+        time.sleep(5.0)  # Bound request rate now that the entire feed is scanned.
+        published = parse_timestamp(metadata.get("published_time"))
+        modified = parse_timestamp(metadata.get("modified_time"))
+        # RSS pubDate can describe an update. Never use it as original publication.
+        if published is None or modified is None or modified < published:
+            logger.warning("Missing/invalid article dates for %s; retry next run", guid)
+            continue
+        paper["scraped_published_time"] = published.isoformat()
+        paper["scraped_modified_time"] = modified.isoformat()
+        paper["is_update"] = modified > published
+        papers.append(paper)
+
+    # Keep first-start notifications bounded to the newest publication day.
+    # Persist the baseline before delivery so failures remain pending, not reinitialized.
+    target_date = None
+    if is_first_run and papers:
+        today = datetime.now(timezone.utc).date().isoformat()
+        dates = [p["scraped_published_time"][:10] for p in papers]
+        target_date = today if today in dates else max(dates)
+        for paper in papers:
+            if paper["scraped_published_time"][:10] != target_date:
+                processed_ids[paper["guid"]] = paper["scraped_modified_time"]
+        if not dry_run:
             save_state(processed_ids)
-        return
-        
-    logger.info(f"Found {len(new_papers)} new paper(s) to process.")
-    
-    embeds_to_post = []
-    
-    for paper in new_papers:
+
+    sent = 0
+    for paper in papers:
+        guid = paper["guid"]
+        modified = paper["scraped_modified_time"]
+        if guid in processed_ids:
+            stored = processed_ids[guid]
+            if stored == "":
+                # Legacy list migration: baseline without resending.
+                processed_ids[guid] = modified
+                if not dry_run:
+                    save_state(processed_ids)
+                continue
+            stored_dt = parse_timestamp(stored)
+            if stored_dt is None:
+                raise ValueError("Invalid stored modification time for " + guid)
+            if parse_timestamp(modified) <= stored_dt:
+                continue  # Do not stop: later RSS entries may still be pending.
+            paper["is_update"] = True
+
+        logger.info("Found %s paper: %s (%s)",
+                    "updated" if paper["is_update"] else "new", paper["title"], guid)
+        if dry_run:
+            continue
         summary = summarize_abstract(paper["title"], paper["authors"], paper["abstract"])
         embed = build_discord_embed(paper, summary)
-        embeds_to_post.append(embed)
-        
-    # Post consolidated notification to Discord
-    post_batches_to_discord(embeds_to_post)
-    
-    # Save final processed state
-    save_state(processed_ids)
-    logger.info("Done!")
+        # Checkpoint each individual success. A failed paper stays pending while
+        # other deliveries can proceed; it will be retried even behind known items.
+        if post_batches_to_discord([embed]):
+            processed_ids[guid] = modified
+            save_state(processed_ids)
+            sent += 1
+        else:
+            logger.warning("Notification pending for %s", guid)
+    logger.info("Feed scan complete: %d paper(s) checked, %d delivered", len(papers), sent)
+
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="IACR ePrint notification bot")
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="scan and log classifications without LLM, Discord, or state changes",
+    )
     parser.add_argument(
         "--test-notification",
         action="store_true",
@@ -607,6 +576,9 @@ def main(argv=None):
     args = parse_args(argv)
 
     try:
+        if args.dry_run:
+            run_bot_logic(dry_run=True)
+            return
         if args.test_notification:
             send_test_notification()
             return
